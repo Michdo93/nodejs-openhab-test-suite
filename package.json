@@ -1,0 +1,37 @@
+{
+  "name": "nodejs-openhab-test-suite",
+  "version": "1.0.0",
+  "description": "Test suite for openHAB installations – Node.js port of openhab-test-suite. Powered by nodejs-openhab-rest-client.",
+  "author": "Michael Christian Dörflinger <michaeldoerflinger93@gmail.com>",
+  "license": "MIT",
+  "homepage": "https://github.com/Michdo93/nodejs-openhab-test-suite",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Michdo93/nodejs-openhab-test-suite.git"
+  },
+  "keywords": [
+    "openhab", "smarthome", "iot", "testing",
+    "home-automation", "test-suite"
+  ],
+  "main":   "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "exports": {
+    ".": {
+      "import":  "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js"
+    }
+  },
+  "types": "./dist/types/index.d.ts",
+  "files": ["dist/", "README.md", "LICENSE"],
+  "engines": { "node": ">=18.0.0" },
+  "scripts": {
+    "build":          "node build.js",
+    "test":           "node test/test.js",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "nodejs-openhab-rest-client": ">=1.0.0"
+  },
+  "devDependencies": {},
+  "type": "module"
+}
