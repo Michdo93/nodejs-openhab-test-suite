@@ -1,82 +1,94 @@
 # nodejs-openhab-test-suite
 
-A Node.js testing library for validating openHAB installations.
-Mirrors the Python [openhab-test-suite](https://github.com/Michdo93/openhab-test-suite):
-same class names, same method names.
+Tests for openHAB items, things, rules, links, persistence and sitemaps – in Node.js, for test runners, CI pipelines, cron jobs and pre-flight checks before a service starts. For the browser there is a separate library, [js-openhab-test-suite](https://github.com/Michdo93/js-openhab-test-suite).
 
-Powered by [nodejs-openhab-rest-client](https://github.com/Michdo93/nodejs-openhab-rest-client).
-
-## Classes
-
-| Class | Description |
-|---|---|
-| `ItemTester` | Validates item types, sends commands, verifies state via SSE, auto-resets |
-| `ThingTester` | Checks Thing status (ONLINE/OFFLINE/…), enables/disables Things |
-| `RuleTester` | Runs rules, enables/disables, checks status |
-| `ChannelTester` | Verifies item-channel links and orphaned links |
-| `PersistenceTester` | Checks item registration and historical data |
-| `SitemapTester` | Verifies sitemap existence and item references |
-
-## Requirements
-
-- Node.js ≥ 18
-- `nodejs-openhab-rest-client` as peer dependency
+It mirrors [openhab-test-suite](https://github.com/Michdo93/openhab-test-suite) (Python): **same classes, same methods, same parameters.** It is built on [nodejs-openhab-rest-client](https://github.com/Michdo93/nodejs-openhab-rest-client) ≥ 2.0.0. Every check and test method resolves to `true` or `false`.
 
 ## Installation
 
-```bash
-npm install nodejs-openhab-test-suite nodejs-openhab-rest-client
+Node.js 18 or newer. Install the client library (peer dependency) and the test suite:
+
+```sh
+npm install github:Michdo93/nodejs-openhab-rest-client github:Michdo93/nodejs-openhab-test-suite
 ```
 
-## Usage
+ES module and CommonJS are both supported, TypeScript declarations are included.
 
-```javascript
-// ESM
-import { OpenHABClient, Items, Things, Rules,
-         Links, Persistence, Sitemaps, ItemEvents }
-  from "nodejs-openhab-rest-client";
-import { ItemTester, ThingTester, RuleTester,
-         ChannelTester, PersistenceTester, SitemapTester }
-  from "nodejs-openhab-test-suite";
+## Example
 
-const raw = new OpenHABClient("http://127.0.0.1:8080", "openhab", "habopen");
-await raw.login();
+```js
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { OpenHABClient } from "nodejs-openhab-rest-client";
+import { ItemTester, ThingTester, RuleTester } from "nodejs-openhab-test-suite";
+// CommonJS: const { ItemTester } = require("nodejs-openhab-test-suite");
 
-// Attach API instances
-raw._items       = new Items(raw);
-raw._things      = new Things(raw);
-raw._rules       = new Rules(raw);
-raw._links       = new Links(raw);
-raw._persistence = new Persistence(raw);
-raw._sitemaps    = new Sitemaps(raw);
-raw._itemEvents  = new ItemEvents(raw);
+const client = new OpenHABClient(process.env.OPENHAB_URL, null, null, process.env.OPENHAB_TOKEN);
 
-const items = new ItemTester(raw);
-console.log(await items.testSwitch("MySwitch", "ON", "ON", 10)); // true
-
-const things = new ThingTester(raw);
-console.log(await things.isThingOnline("astro:sun:local")); // true
-
-const rules = new RuleTester(raw);
-await rules.enableRule("my-rule");
-await rules.runRule("my-rule");
+test("living room", async () => {
+  const items = new ItemTester(client);
+  assert.ok(await items.checkItemIsType("Wohnzimmer_Temperatur", "Number:Temperature"));
+  assert.ok(await items.testSwitch("Wohnzimmer_Licht", "ON", "ON", 5));
+  assert.ok(await new ThingTester(client).isThingOnline("astro:sun:zuhause"));
+  assert.ok(await new RuleTester(client).testRuleExecution("restbuch-1", "Haus_Status", "Nachtruhe"));
+});
 ```
 
-## Build
+Run it with `node --test`. The `test…` methods of `ItemTester` open an event stream, send the command (an update for Contact and Location), wait up to `timeout` seconds for the expected state and restore the previous state afterwards. `expectedState` may also be an array of accepted states, e.g. `["23 °C", "23.0 °C"]`. Diagnostics go to `console.log` / `console.error`, as the Python version prints them.
 
-```bash
-npm run build
+## Reference
+
+### ItemTester
+
+| Method | Returns `true` if … |
+|---|---|
+| `doesItemExist(itemName)` | the item exists |
+| `checkItemIsType(itemName, itemType)` | the item has the type – base type (`"Number"`) or with dimension (`"Number:Temperature"`) |
+| `checkItemHasState(itemName, state)` | the item currently has the state |
+| `isGroupItem(itemName)` | the item is a group |
+| `getGroupMembers(groupName)` | *(returns the member list)* |
+| `doesGroupContainMember(groupName, memberName)` | the group contains the member |
+| `checkGroupMemberState(groupName, memberName, expectedState)` | the member has the state |
+| `testSwitch / testDimmer / testColor / testRollershutter / testNumber / testString / testPlayer / testDateTime / testImage (itemName, command, expectedState = null, timeout = 10)` | the command leads to the expected state |
+| `testContact(itemName, update = null, expectedState = null, timeout = 10)`, `testLocation(itemName, update, …)` | the update leads to the expected state |
+| `ItemTester.isValidSwitchValue(v)` … `isValidImageValue(v)` | static validators (also as `_isValid…`, the Python names) |
+
+### ThingTester
+
+`getThingStatus(thingUID)` (returns the status or `"UNKNOWN"`), `isThingStatus(thingUID, status)`, `isThingOnline`, `isThingOffline`, `isThingPending`, `isThingUnknown`, `isThingUninitialized`, `isThingError`, `enableThing`, `disableThing`
+
+### RuleTester
+
+`runRule(ruleUID, contextData = null)`, `enableRule`, `disableRule`, `testRuleExecution(ruleUID, expectedItem, expectedValue, waitSeconds = 2)`, `isRuleActive`, `isRuleDisabled`, `isRuleRunning`, `isRuleIdle`, `getRuleStatus` (returns `{ status, statusDetail, editable, name, uid }` or `{}`)
+
+### ChannelTester
+
+`isItemLinkedToChannel(itemName, channelUID)`, `getLinksForItem(itemName)` (returns the links), `isItemLinkedToAnyChannel(itemName)`, `hasOrphanedLinks()`
+
+### PersistenceTester
+
+`isItemPersisted(serviceID, itemName)`, `hasDataInRange(serviceID, itemName, startTime, endTime)` (ISO strings or `Date`), `checkLastPersistedState(serviceID, itemName, expectedState)`
+
+### SitemapTester
+
+`doesSitemapExist(sitemapName)`, `doesSitemapContainItem(sitemapName, itemName)`
+
+## Upgrading from 1.x
+
+- Requires nodejs-openhab-rest-client ≥ 2.0.0 (results as `{ error }` instead of exceptions).
+- Testers take the client directly: `new ItemTester(client)`. The 1.x workaround with `client._lib` is gone.
+- Unknown things and rules now give `false` (1.x reported `true` for `enableThing`, `enableRule`, `runRule` and `isRuleActive` with an unknown UID).
+- `checkItemIsType` accepts types with dimension (`"Number:Temperature"`), validators accept the number 0, `hasDataInRange` really filters by time, and a test waits for devices that confirm late.
+
+## Development
+
+```sh
+npm run build   # dist/esm, dist/cjs, dist/types from src/index.js
+npm test        # unit tests; integration tests run when OPENHAB_URL and OPENHAB_TOKEN are set
 ```
 
-Produces `dist/esm/`, `dist/cjs/`, `dist/types/`.
-
-## Test
-
-```bash
-OPENHAB_URL=http://127.0.0.1:8080 OPENHAB_USER=openhab OPENHAB_PASS=habopen \
-  npm test
-```
+The integration tests expect the exercise configuration of the book series "openHAB REST API" (items, astro thing, rule `restbuch-1`, sitemap `restbuch`, persistence `inmemory`).
 
 ## License
 
-MIT
+MIT – see [LICENSE](LICENSE).

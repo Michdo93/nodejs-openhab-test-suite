@@ -1,0 +1,619 @@
+/**
+ * nodejs-openhab-test-suite
+ *
+ * Tests for openHAB items, things, rules, links, persistence and sitemaps in Node.js.
+ * Mirrors openhab-test-suite (Python) and js-openhab-test-suite (browser):
+ * same classes, same methods, same parameters. All check and test methods
+ * resolve to true or false.
+ *
+ *   import { OpenHABClient } from "nodejs-openhab-rest-client";   // >= 2.0.0
+ *   import { ItemTester } from "nodejs-openhab-test-suite";
+ *
+ *   const client = new OpenHABClient("http://openhab:8080", null, null, process.env.OPENHAB_TOKEN);
+ *   const ok = await new ItemTester(client).testSwitch("Wohnzimmer_Licht", "ON", "ON", 10);
+ *
+ * Node.js >= 18. Peer dependency: nodejs-openhab-rest-client >= 2.0.0.
+ *
+ * @license MIT
+ * @version 2.0.0
+ */
+import * as lib from "nodejs-openhab-rest-client";
+
+function createTestSuite(lib) {
+  const { Items, ItemEvents, Things, Rules, Links, Persistence, Sitemaps, iterSSEEvents } = lib;
+  if (!Items || !iterSSEEvents) {
+    throw new Error("nodejs-openhab-test-suite needs nodejs-openhab-rest-client >= 2.0.0");
+  }
+
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  /** true for the { error: "…" } objects of nodejs-openhab-rest-client */
+  function isError(result) {
+    return result !== null && typeof result === "object" && !Array.isArray(result) && "error" in result;
+  }
+
+  function asObject(result) {
+    if (result === null || result === undefined || isError(result)) return {};
+    if (typeof result === "string") {
+      try { const parsed = JSON.parse(result); return parsed && typeof parsed === "object" ? parsed : {}; }
+      catch { return {}; }
+    }
+    return typeof result === "object" ? result : {};
+  }
+
+  function asList(result) {
+    if (Array.isArray(result)) return result;
+    if (typeof result === "string") {
+      try { const parsed = JSON.parse(result); return Array.isArray(parsed) ? parsed : []; }
+      catch { return []; }
+    }
+    return [];
+  }
+
+  /** expected may be a single value or an array/Set of accepted values */
+  function matches(state, expected) {
+    if (expected instanceof Set) expected = [...expected];
+    if (Array.isArray(expected)) return expected.some(e => String(state) === String(e));
+    return String(state) === String(expected);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // ItemTester
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  const VALID_TYPES = ["Color", "Contact", "DateTime", "Dimmer", "Group", "Image",
+                       "Location", "Number", "Player", "Rollershutter", "String", "Switch"];
+
+  class ItemTester {
+    constructor(client) {
+      this.client = client;
+      this.itemsAPI = new Items(client);
+      this.itemEventsAPI = new ItemEvents(client);
+    }
+
+    // ── Command validators ───────────────────────────────────────────────────
+
+    static isValidSwitchValue(value) {
+      return typeof value === "string" && ["ON", "OFF"].includes(value.trim().toUpperCase());
+    }
+
+    static isValidContactValue(value) {
+      return typeof value === "string" && ["OPEN", "CLOSED"].includes(value.trim().toUpperCase());
+    }
+
+    static _isPercent(value) {
+      const text = String(value).trim();
+      if (!/^-?\d+(\.\d+)?$/.test(text)) return false;
+      const number = Number(text);
+      return number >= 0 && number <= 100;
+    }
+
+    static isValidDimmerValue(value) {
+      if (value === null || value === undefined) return false;
+      const v = String(value).trim().toUpperCase();
+      return ["ON", "OFF", "INCREASE", "DECREASE"].includes(v) || ItemTester._isPercent(v);
+    }
+
+    static isValidRollershutterValue(value) {
+      if (value === null || value === undefined) return false;
+      const v = String(value).trim().toUpperCase();
+      return ["UP", "DOWN", "STOP", "MOVE"].includes(v) || ItemTester._isPercent(v);
+    }
+
+    /** ON, OFF, INCREASE, DECREASE or "H,S,B" with H 0–360, S and B 0–100 */
+    static isValidColorValue(value) {
+      if (typeof value !== "string") return false;
+      if (["ON", "OFF", "INCREASE", "DECREASE"].includes(value.trim().toUpperCase())) return true;
+      const parts = value.trim().split(",");
+      if (parts.length !== 3 || parts.some(p => p.trim() === "" || isNaN(Number(p)))) return false;
+      const [h, s, b] = parts.map(Number);
+      return h >= 0 && h <= 360 && s >= 0 && s <= 100 && b >= 0 && b <= 100;
+    }
+
+    static isValidPlayerValue(value) {
+      return typeof value === "string" &&
+        ["PLAY", "PAUSE", "NEXT", "PREVIOUS", "REWIND", "FASTFORWARD"].includes(value.trim().toUpperCase());
+    }
+
+    /** a number, optionally followed by a unit: "20", "20.5", "20 °C", "100 %" */
+    static isValidNumberValue(value) {
+      if (value === null || value === undefined) return false;
+      return /^-?\d+(\.\d+)?(\s+\S+)?$/.test(String(value).trim());
+    }
+
+    /** ISO 8601, e.g. "2024-01-15T08:30:00+0000" or "2024-01-15T08:30:00.000Z" */
+    static isValidDateTimeValue(value) {
+      return typeof value === "string" &&
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$/.test(value.trim());
+    }
+
+    /** "lat,lon" or "lat,lon,alt" */
+    static isValidLocationValue(value) {
+      if (typeof value !== "string") return false;
+      const parts = value.trim().split(",");
+      if (parts.length < 2 || parts.length > 3 || parts.some(p => p.trim() === "" || isNaN(Number(p)))) return false;
+      const [lat, lon] = parts.map(Number);
+      return lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;
+    }
+
+    static isValidStringValue(value) {
+      return value !== null && value !== undefined;
+    }
+
+    /** http/https URL or data:image/…;base64, URI */
+    static isValidImageValue(value) {
+      if (typeof value !== "string") return false;
+      const v = value.trim();
+      return v.startsWith("http://") || v.startsWith("https://") || /^data:image\/[a-zA-Z+]+;base64,/.test(v);
+    }
+
+    // ── Checks ───────────────────────────────────────────────────────────────
+
+    async doesItemExist(itemName) {
+      const item = asObject(await this.itemsAPI.getItem(itemName));
+      if (item.name === itemName) return true;
+      console.error(`Error: The item '${itemName}' does not exist!`);
+      return false;
+    }
+
+    /** itemType: "Number" (base type) or "Number:Temperature" (with dimension) */
+    async checkItemIsType(itemName, itemType) {
+      if (!VALID_TYPES.includes(String(itemType).split(":")[0])) {
+        console.error(`Error: '${itemType}' is not a valid item type.`);
+        return false;
+      }
+      const result = await this.itemsAPI.getItem(itemName);
+      if (isError(result)) {
+        console.error(`Error: The item '${itemName}' could not be found.`);
+        return false;
+      }
+      const actualType = asObject(result).type || "";
+      if (actualType.split(":")[0] === itemType || actualType === itemType) return true;
+      console.error(`Error: The item '${itemName}' is not of type '${itemType}'! Found type: '${actualType}'`);
+      return false;
+    }
+
+    async checkItemHasState(itemName, state) {
+      const current = await this.itemsAPI.getItemState(itemName);
+      if (isError(current) || current === null || current === undefined) {
+        console.error(`Error: Could not retrieve the state for item '${itemName}'.`);
+        return false;
+      }
+      return String(current) === String(state);
+    }
+
+    async isGroupItem(itemName) {
+      return this.checkItemIsType(itemName, "Group");
+    }
+
+    async getGroupMembers(groupName) {
+      const group = asObject(await this.itemsAPI.getItem(groupName, { recursive: true }));
+      return Array.isArray(group.members) ? group.members : [];
+    }
+
+    async doesGroupContainMember(groupName, memberName) {
+      return (await this.getGroupMembers(groupName)).some(m => m.name === memberName);
+    }
+
+    async checkGroupMemberState(groupName, memberName, expectedState) {
+      const member = (await this.getGroupMembers(groupName)).find(m => m.name === memberName);
+      return member ? String(member.state) === String(expectedState) : false;
+    }
+
+    // ── Tests per item type ──────────────────────────────────────────────────
+    // Each test sends a command (or an update for Contact and Location), waits
+    // up to `timeout` seconds for the expected state and restores the previous
+    // state afterwards. expectedState may also be an array of accepted states.
+
+    async _typedTest(itemName, itemType, value, valid, hint, expectedState, timeout) {
+      if (!await this.checkItemIsType(itemName, itemType)) {
+        console.error(`Test failed: '${itemName}' is not of type '${itemType}'.`);
+        return false;
+      }
+      if (!valid) {
+        console.error(`Test failed: '${value}' is not a valid ${itemType} value. ${hint}`);
+        return false;
+      }
+      return this._testItem(itemName, itemType, value, expectedState, timeout);
+    }
+
+    testColor(itemName, command, expectedState = null, timeout = 10) {
+      return this._typedTest(itemName, "Color", command, ItemTester.isValidColorValue(command),
+        "Use ON, OFF, INCREASE, DECREASE, or 'H,S,B' (e.g. '240,100,100').", expectedState, timeout);
+    }
+
+    testContact(itemName, update = null, expectedState = null, timeout = 10) {
+      return this._typedTest(itemName, "Contact", update,
+        update === null || ItemTester.isValidContactValue(update), "Use OPEN or CLOSED.", expectedState, timeout);
+    }
+
+    testDateTime(itemName, command, expectedState = null, timeout = 10) {
+      return this._typedTest(itemName, "DateTime", command, ItemTester.isValidDateTimeValue(command),
+        "Use ISO 8601, e.g. '2024-01-15T08:30:00+0000'.", expectedState, timeout);
+    }
+
+    testDimmer(itemName, command, expectedState = null, timeout = 10) {
+      return this._typedTest(itemName, "Dimmer", command === null ? null : String(command),
+        ItemTester.isValidDimmerValue(command),
+        "Use ON, OFF, INCREASE, DECREASE, or a percentage between 0 and 100.", expectedState, timeout);
+    }
+
+    testImage(itemName, command, expectedState = null, timeout = 10) {
+      return this._typedTest(itemName, "Image", command, ItemTester.isValidImageValue(command),
+        "Use an http/https URL or a data URI (data:image/...;base64,...).", expectedState, timeout);
+    }
+
+    testLocation(itemName, update, expectedState = null, timeout = 10) {
+      return this._typedTest(itemName, "Location", update, ItemTester.isValidLocationValue(update),
+        "Use 'lat,lon' or 'lat,lon,alt', e.g. '48.7758,9.1829'.", expectedState, timeout);
+    }
+
+    testNumber(itemName, command, expectedState = null, timeout = 10) {
+      return this._typedTest(itemName, "Number", command === null ? null : String(command),
+        ItemTester.isValidNumberValue(command),
+        "Use a number, optionally with a unit (e.g. '20', '20.5', '20 °C').", expectedState, timeout);
+    }
+
+    testPlayer(itemName, command, expectedState = null, timeout = 10) {
+      return this._typedTest(itemName, "Player", command, ItemTester.isValidPlayerValue(command),
+        "Use PLAY, PAUSE, NEXT, PREVIOUS, REWIND, or FASTFORWARD.", expectedState, timeout);
+    }
+
+    testRollershutter(itemName, command, expectedState = null, timeout = 10) {
+      return this._typedTest(itemName, "Rollershutter", command === null ? null : String(command),
+        ItemTester.isValidRollershutterValue(command),
+        "Use UP, DOWN, STOP, MOVE, or a percentage between 0 and 100.", expectedState, timeout);
+    }
+
+    testString(itemName, command, expectedState = null, timeout = 10) {
+      return this._typedTest(itemName, "String", command, ItemTester.isValidStringValue(command),
+        "The command must not be null.", expectedState, timeout);
+    }
+
+    testSwitch(itemName, command, expectedState = null, timeout = 10) {
+      return this._typedTest(itemName, "Switch", command, ItemTester.isValidSwitchValue(command),
+        "Use ON or OFF.", expectedState, timeout);
+    }
+
+    // ── Core ─────────────────────────────────────────────────────────────────
+
+    async _testItem(itemName, itemType, commandOrUpdate = null, expectedState = null, timeout = 10) {
+      const isUpdate = itemType === "Contact" || itemType === "Location";
+      let initialState = null;
+      let stream = null;
+      let timer = null;
+      try {
+        if (commandOrUpdate !== null && commandOrUpdate !== undefined) {
+          const state = await this.itemsAPI.getItemState(itemName);
+          if (isError(state)) console.warn(`Warning: Could not retrieve initial state for item '${itemName}'.`);
+          else initialState = state;
+        }
+
+        // open the stream before sending, so that no event is missed
+        stream = await this.itemEventsAPI.ItemStateChangedEvent(itemName);
+        if (isError(stream)) {
+          console.error(`Error: No event stream for item '${itemName}': ${stream.error}`);
+          return false;
+        }
+
+        if (commandOrUpdate !== null && commandOrUpdate !== undefined) {
+          const sent = isUpdate
+            ? await this.itemsAPI.postUpdate(itemName, String(commandOrUpdate))
+            : await this.itemsAPI.sendCommand(itemName, String(commandOrUpdate));
+          if (isError(sent)) {
+            console.error(`Error: '${commandOrUpdate}' was rejected for '${itemName}': ${sent.error}`);
+            return false;
+          }
+        }
+
+        if (expectedState === null || expectedState === undefined) return true;
+
+        // if the state does not change at all, the check after the timeout decides
+        let reached = false;
+        timer = setTimeout(() => stream.abort(), timeout * 1000);
+        try {
+          for await (const event of iterSSEEvents(stream)) {
+            if (event.type !== "ItemStateChangedEvent") continue;
+            if (matches(event.payload && event.payload.value, expectedState)) {
+              console.log(`Success: '${itemName}' reached state '${event.payload.value}'.`);
+              reached = true;
+              break;
+            }
+          }
+        } catch { /* aborted after timeout */ }
+        if (reached) return true;
+        return this._checkFinalState(itemName, expectedState);
+      } catch (err) {
+        console.error(`Error testing '${itemName}': ${err.message}`);
+        return false;
+      } finally {
+        if (timer) clearTimeout(timer);
+        if (stream && typeof stream.abort === "function") stream.abort();
+        await this._resetItem(itemName, itemType, initialState);
+      }
+    }
+
+    async _resetItem(itemName, itemType, initialState) {
+      if (initialState === null || initialState === undefined) return;
+      // NULL/UNDEF are no valid commands – restore them as state
+      const asUpdate = itemType === "Contact" || itemType === "Location" ||
+                       initialState === "NULL" || initialState === "UNDEF";
+      const result = asUpdate
+        ? await this.itemsAPI.postUpdate(itemName, initialState)
+        : await this.itemsAPI.sendCommand(itemName, initialState);
+      if (isError(result)) {
+        console.warn(`Warning: Could not reset item '${itemName}' to '${initialState}': ${result.error}`);
+      }
+    }
+
+    async _checkFinalState(itemName, expectedState) {
+      const accepted = expectedState instanceof Set ? [...expectedState]
+        : Array.isArray(expectedState) ? expectedState : [expectedState];
+      for (const state of accepted) {
+        if (await this.checkItemHasState(itemName, state)) return true;
+      }
+      console.error(`Error: After fallback, state of '${itemName}' is not ${
+        accepted.length > 1 ? `in [${accepted.join(", ")}]` : `'${accepted[0]}'`}.`);
+      return false;
+    }
+  }
+
+  // Python names of the validators (static, with leading underscore)
+  for (const name of Object.getOwnPropertyNames(ItemTester)) {
+    if (name.startsWith("isValid")) ItemTester["_" + name] = ItemTester[name];
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // ThingTester
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  class ThingTester {
+    constructor(client) {
+      this.client = client;
+      this.thingsAPI = new Things(client);
+    }
+
+    /** Status of a thing ("ONLINE", "OFFLINE", …) or "UNKNOWN" if it cannot be determined. */
+    async getThingStatus(thingUID) {
+      const thing = asObject(await this.thingsAPI.getThing(thingUID));
+      return (thing.statusInfo && thing.statusInfo.status) || "UNKNOWN";
+    }
+
+    async _getThingStatus(thingUID) {
+      return this.getThingStatus(thingUID);
+    }
+
+    async isThingStatus(thingUID, statusToCheck) {
+      return (await this.getThingStatus(thingUID)) === statusToCheck;
+    }
+
+    isThingOnline(thingUID) { return this.isThingStatus(thingUID, "ONLINE"); }
+    isThingOffline(thingUID) { return this.isThingStatus(thingUID, "OFFLINE"); }
+    isThingPending(thingUID) { return this.isThingStatus(thingUID, "PENDING"); }
+    isThingUnknown(thingUID) { return this.isThingStatus(thingUID, "UNKNOWN"); }
+    isThingUninitialized(thingUID) { return this.isThingStatus(thingUID, "UNINITIALIZED"); }
+    isThingError(thingUID) { return this.isThingStatus(thingUID, "ERROR"); }
+
+    async _setEnabled(thingUID, enabled) {
+      const result = await this.thingsAPI.setThingStatus(thingUID, enabled);
+      const verb = enabled ? "enabled" : "disabled";
+      if (isError(result)) {
+        console.error(`Error ${enabled ? "enabling" : "disabling"} thing ${thingUID}: ${result.error}`);
+        return false;
+      }
+      console.log(`Thing ${thingUID} was successfully ${verb}.`);
+      return true;
+    }
+
+    enableThing(thingUID) { return this._setEnabled(thingUID, true); }
+    disableThing(thingUID) { return this._setEnabled(thingUID, false); }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // RuleTester
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  class RuleTester {
+    constructor(client) {
+      this.client = client;
+      this.rulesAPI = new Rules(client);
+      this.itemsAPI = new Items(client);
+    }
+
+    async _getRule(ruleUID) {
+      const rule = asObject(await this.rulesAPI.getRule(ruleUID));
+      if (!rule.status) {
+        console.error(`Error retrieving the status of rule ${ruleUID}.`);
+        return null;
+      }
+      return rule;
+    }
+
+    async runRule(ruleUID, contextData = null) {
+      if (await this.isRuleDisabled(ruleUID)) {
+        console.error(`Error: Rule ${ruleUID} could not be executed because it is disabled.`);
+        return false;
+      }
+      const result = await this.rulesAPI.runNow(ruleUID, contextData);
+      if (isError(result)) {
+        console.error(`Error executing rule ${ruleUID}: ${result.error}`);
+        return false;
+      }
+      console.log(`Rule ${ruleUID} executed successfully.`);
+      return true;
+    }
+
+    async enableRule(ruleUID) {
+      const result = await this.rulesAPI.enable(ruleUID);
+      if (isError(result)) {
+        console.error(`Error enabling rule ${ruleUID}: ${result.error}`);
+        return false;
+      }
+      console.log(`Rule ${ruleUID} enabled successfully.`);
+      return true;
+    }
+
+    async disableRule(ruleUID) {
+      const result = await this.rulesAPI.disable(ruleUID);
+      if (isError(result)) {
+        console.error(`Error disabling rule ${ruleUID}: ${result.error}`);
+        return false;
+      }
+      console.log(`Rule ${ruleUID} disabled successfully.`);
+      return true;
+    }
+
+    /**
+     * Runs a rule and checks afterwards whether an item has the expected value.
+     * @param waitSeconds  time the rule gets before the check (default 2, as in Python)
+     */
+    async testRuleExecution(ruleUID, expectedItem, expectedValue, waitSeconds = 2) {
+      if (!await this.runRule(ruleUID)) {
+        console.error(`Error: Rule ${ruleUID} could not be executed.`);
+        return false;
+      }
+      await sleep(waitSeconds * 1000);
+      const state = await this.itemsAPI.getItemState(expectedItem);
+      if (isError(state) || String(state) !== String(expectedValue)) {
+        console.error(`Error: State of item ${expectedItem} after rule execution does not match. ` +
+          `Expected: ${expectedValue}, Found: ${isError(state) ? state.error : state}`);
+        return false;
+      }
+      console.log(`${expectedItem} state after rule execution: ${state}`);
+      return true;
+    }
+
+    async isRuleActive(ruleUID) {
+      const rule = await this._getRule(ruleUID);
+      if (!rule) return false;
+      console.log(`Rule status: ${rule.status.status}`);
+      return rule.status.status !== "UNINITIALIZED";
+    }
+
+    async isRuleDisabled(ruleUID) {
+      const rule = await this._getRule(ruleUID);
+      if (!rule) return false;
+      console.log(`Rule status: ${rule.status.status}, Detail: ${rule.status.statusDetail}`);
+      return rule.status.status === "UNINITIALIZED" && rule.status.statusDetail === "DISABLED";
+    }
+
+    async isRuleRunning(ruleUID) {
+      const rule = await this._getRule(ruleUID);
+      if (!rule) return false;
+      console.log(`Rule status: ${rule.status.status}`);
+      return rule.status.status === "RUNNING";
+    }
+
+    async isRuleIdle(ruleUID) {
+      const rule = await this._getRule(ruleUID);
+      if (!rule) return false;
+      console.log(`Rule status: ${rule.status.status}`);
+      return rule.status.status === "IDLE";
+    }
+
+    /** { status, statusDetail, editable, name, uid } or {} */
+    async getRuleStatus(ruleUID) {
+      const rule = await this._getRule(ruleUID);
+      if (!rule) return {};
+      return {
+        status: rule.status.status || "UNKNOWN",
+        statusDetail: rule.status.statusDetail || "UNKNOWN",
+        editable: rule.editable ?? false,
+        name: rule.name || "",
+        uid: rule.uid || "",
+      };
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // ChannelTester
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  class ChannelTester {
+    constructor(client) {
+      this.client = client;
+      this.links = new Links(client);
+    }
+
+    async isItemLinkedToChannel(itemName, channelUID) {
+      return asObject(await this.links.getLink(itemName, channelUID)).itemName === itemName;
+    }
+
+    async getLinksForItem(itemName) {
+      return asList(await this.links.getLinks(null, itemName));
+    }
+
+    async hasOrphanedLinks() {
+      return asList(await this.links.getOrphanLinks()).length > 0;
+    }
+
+    async isItemLinkedToAnyChannel(itemName) {
+      return (await this.getLinksForItem(itemName)).length > 0;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // PersistenceTester
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  class PersistenceTester {
+    constructor(client) {
+      this.client = client;
+      this.persistence = new Persistence(client);
+    }
+
+    async isItemPersisted(serviceID, itemName) {
+      return asList(await this.persistence.getItemsFromService(serviceID))
+        .some(entry => (entry && typeof entry === "object" ? entry.name : entry) === itemName);
+    }
+
+    /** startTime/endTime as ISO 8601 strings or Date objects */
+    async hasDataInRange(serviceID, itemName, startTime, endTime) {
+      const iso = t => (t instanceof Date ? t.toISOString() : t);
+      const data = asObject(await this.persistence.getItemPersistenceData(itemName, serviceID,
+        { startTime: iso(startTime), endTime: iso(endTime) }));
+      return Array.isArray(data.data) && data.data.length > 0;
+    }
+
+    async checkLastPersistedState(serviceID, itemName, expectedState) {
+      const data = asObject(await this.persistence.getItemPersistenceData(itemName, serviceID));
+      const entries = Array.isArray(data.data) ? data.data : [];
+      if (!entries.length) return false;
+      return String(entries[entries.length - 1].state) === String(expectedState);
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // SitemapTester
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  class SitemapTester {
+    constructor(client) {
+      this.client = client;
+      this.sitemaps = new Sitemaps(client);
+    }
+
+    async doesSitemapExist(sitemapName) {
+      return asList(await this.sitemaps.getSitemaps()).some(s => s.name === sitemapName);
+    }
+
+    async doesSitemapContainItem(sitemapName, itemName) {
+      return this._searchForItem(asObject(await this.sitemaps.getSitemap(sitemapName)), itemName);
+    }
+
+    _searchForItem(node, itemName) {
+      if (Array.isArray(node)) return node.some(element => this._searchForItem(element, itemName));
+      if (node && typeof node === "object") {
+        if (node.item && node.item.name === itemName) return true;
+        return Object.values(node).some(value => this._searchForItem(value, itemName));
+      }
+      return false;
+    }
+  }
+
+  return { ItemTester, ThingTester, RuleTester, ChannelTester, PersistenceTester, SitemapTester };
+}
+const suite = createTestSuite(lib);
+
+export const { ItemTester, ThingTester, RuleTester, ChannelTester, PersistenceTester, SitemapTester } = suite;
+export { createTestSuite };
